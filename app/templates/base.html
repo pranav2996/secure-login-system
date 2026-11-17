@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1020"><title>{% block title %}Secure Login System{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script defer src="{{ url_for('static', filename='js/main.js') }}"></script>
+</head>
+<body class="{% block body_class %}{% endblock %}">
+  {% set page_class = self.body_class()|trim %}
+  {% if page_class %}
+  <div class="login-backdrop scene-{{ page_class }}" aria-hidden="true">
+    {% if page_class == 'login-page' %}
+    <video class="login-backdrop-video" autoplay muted loop playsinline preload="metadata" tabindex="-1">
+      <source src="{{ url_for('static', filename='video/secure-login-background.mp4') }}" type="video/mp4">
+    </video>
+    <canvas class="login-ambient-canvas" aria-hidden="true"></canvas>
+    {% endif %}
+    <div class="login-backdrop-shade"></div>
+    <div class="fallback-orb"><span></span></div>
+  </div>
+  {% endif %}
+  <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+  {% if page_class == 'login-page' %}<div class="login-frame">{% endif %}
+  <header class="topbar"><a class="brand" href="{{ url_for('auth.home') }}"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 2.8 19 5.6v5.1c0 4.7-2.8 8.4-7 10.5-4.2-2.1-7-5.8-7-10.5V5.6l7-2.8Z"/><rect x="9" y="10.5" width="6" height="5.3" rx="1.1"/><path d="M10.5 10.5V9a1.5 1.5 0 0 1 3 0v1.5"/></svg></span><span>Secure<span class="brand-light">Login</span></span></a><span class="top-note"><span class="pulse"></span> Private by design</span></header>
+  <main class="page-shell {% block shell_class %}{% endblock %}">
+    {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}<div class="toast-stack" role="status" aria-live="polite">{% for category, message in messages %}<div class="toast toast-{{ category }}">{{ message }}<button type="button" class="toast-close" aria-label="Dismiss notification">×</button></div>{% endfor %}</div>{% endif %}{% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+  {% if page_class == 'login-page' %}</div>{% endif %}
+  <footer class="footer">Protected with care <span>·</span> Secure Login System</footer>
+</body>
+</html>
