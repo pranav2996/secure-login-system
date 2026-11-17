@@ -58,9 +58,9 @@ The launcher creates `venv` and a unique local `.env` if absent, installs the pi
 
 ## Deploy to Render
 
-Render serves this Flask application through Gunicorn using the WSGI object `run:app`. Render terminates HTTPS at its load balancer and forwards requests to the service. In production, the app trusts one forwarded proxy hop, requires secure session cookies, keeps CSRF enabled, and checks the PostgreSQL schema without creating or altering it. `/healthz` runs `SELECT 1` and is suitable for Render's health check.
+Render serves this Flask application through Gunicorn using the WSGI object `run:app`. Render terminates HTTPS at its load balancer and forwards requests to the service. In production, the app trusts one forwarded proxy hop, requires secure session cookies, keeps CSRF enabled, and initializes missing PostgreSQL tables from the Flask-SQLAlchemy models. `create_all()` is repeatable: it creates missing tables and does not drop, reset, or alter existing tables or rows. `/healthz` runs `SELECT 1` and is suitable for Render's health check.
 
-This app currently has one application table, `user`. Production startup refuses SQLite and refuses a missing or incomplete PostgreSQL schema. It does not create tables, seed accounts, or run migrations. Transfer existing users with the explicit migration process below before the first production deploy.
+This app currently has one application table, `user`. Production startup requires PostgreSQL and creates the table on first startup if it is absent. It does not import or modify the local SQLite database. The local development database and its accounts remain separate; a fresh Neon database starts without those accounts.
 
 ### Create a Neon database
 
@@ -96,23 +96,9 @@ Set these variables in Render's **Environment** page. Enter secret values direct
 
 Do not set `DATABASE_PATH` on Render. It is retained only for local SQLite compatibility. Production requires `DATABASE_URL` pointing to PostgreSQL.
 
-### Migrate existing local users safely
+### Fresh Neon database behavior
 
-The migration utility copies the existing SQLite `user` rows, retaining primary keys, password hashes, encrypted TOTP values, pending TOTP values, recovery-code hashes, flags, and timestamps. It opens the SQLite source in read-only mode and never changes it. PostgreSQL changes are append-only: it creates `user` only if the selected schema has no tables, skips byte-for-byte equivalent rows, and aborts on schema mismatches, duplicate identities, or conflicting rows. It does not drop, truncate, update, or delete records. Review and retain a separate secure backup of the local database before proceeding.
-
-Run this from a secure local environment, after installing project requirements and setting `DATABASE_URL` in that environment from your secret store. The command does not read `.env`. Keep the URL out of shell history and logs. The first command is a dry run and prints only row counts and whether the table would be created:
-
-```powershell
-.\venv\Scripts\python.exe .\migrate_sqlite_to_postgres.py --source .\instance\secure_login.db
-```
-
-Check the output and Neon schema, then only when ready to write run the same command with both explicit flags:
-
-```powershell
-.\venv\Scripts\python.exe .\migrate_sqlite_to_postgres.py --source .\instance\secure_login.db --apply --confirm
-```
-
-Do not run the apply command until you have reviewed the dry-run result and confirmed that `DATABASE_URL` targets the intended Neon database. Then deploy the app. Startup checks for the complete `user` table and fails closed if it is missing; it will not initialize a blank production database. The source file remains unchanged and excluded from Git.
+After setting `APP_ENV=production` and the Neon pooled `DATABASE_URL`, start the Render service. On first startup, Flask-SQLAlchemy creates the missing application table from `app/models.py`; subsequent startups leave the table and its records in place. No local SQLite file is read by application startup, and no local accounts are copied to Neon. The standalone `migrate_sqlite_to_postgres.py` tool is not part of deployment startup and should not be run for this fresh-database setup.
 
 ## Use the app
 
@@ -140,7 +126,7 @@ Tests use isolated temporary SQLite databases. They cover registration validatio
 
 ## Security and limitations
 
-Passwords are bcrypt hashes with per-password salts; TOTP secrets are encrypted using the environment-held key; recovery codes are individually hashed and consumed on use. ORM queries, CSRF protection, rate limits, output escaping, security headers, and conservative cookie settings reduce common risks. The app deliberately does not log credentials. Render uses Gunicorn, HTTPS-aware proxy handling, secure cookies, and Neon PostgreSQL. The Free deployment's in-memory rate limiter resets when the service restarts and is not shared across multiple instances. There is no email verification, password reset, account lockout, shared rate-limit store, or encryption-key rotation workflow. QR setup content and secrets should be treated as sensitive. Always use a unique `SECRET_KEY` and protect the existing `ENCRYPTION_KEY` when migrating users with 2FA.
+Passwords are bcrypt hashes with per-password salts; TOTP secrets are encrypted using the environment-held key; recovery codes are individually hashed and consumed on use. ORM queries, CSRF protection, rate limits, output escaping, security headers, and conservative cookie settings reduce common risks. The app deliberately does not log credentials. Render uses Gunicorn, HTTPS-aware proxy handling, secure cookies, and Neon PostgreSQL. The Free deployment's in-memory rate limiter resets when the service restarts and is not shared across multiple instances. There is no email verification, password reset, account lockout, shared rate-limit store, or encryption-key rotation workflow. QR setup content and secrets should be treated as sensitive. Use a unique `SECRET_KEY` and keep the existing `ENCRYPTION_KEY` protected and unchanged to preserve existing configuration.
 
 ## Troubleshooting
 

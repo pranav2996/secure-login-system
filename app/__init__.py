@@ -83,8 +83,12 @@ def create_app(test_config=None):
 
     with app.app_context():
         if production:
+            # SQLAlchemy create_all() only creates missing model tables; it never
+            # drops or alters existing tables or rows. This lets a fresh Neon
+            # database initialize on first startup and is safe on later starts.
+            db.create_all()
             if not inspect(db.engine).has_table("user"):
-                raise RuntimeError("Production database is missing the user schema; run the migration utility explicitly.")
+                raise RuntimeError("Production database is missing the user schema.")
             from .models import User
             actual = {column["name"] for column in inspect(db.engine).get_columns(User.__tablename__)}
             required = set(User.__table__.columns.keys())
