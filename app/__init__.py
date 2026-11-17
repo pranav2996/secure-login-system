@@ -2,8 +2,9 @@ import os
 import secrets
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
-from flask import Flask, flash, jsonify, redirect, request, session, url_for
+from flask import Flask, flash, jsonify, redirect, request, url_for
 from sqlalchemy import inspect, text
+from sqlalchemy.engine import make_url
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .extensions import csrf, db, limiter
@@ -24,18 +25,12 @@ def create_app(test_config=None):
     if app.config.get("TRUST_PROXY"):
         # Render terminates TLS and forwards the original client scheme/IP.
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
-    if app.config.get("APP_ENV") == "production":
-        database_path = app.config.get("DATABASE_PATH")
-        if not database_path or not os.path.isabs(database_path):
-            raise RuntimeError("Set DATABASE_PATH to an absolute path on Render's persistent disk.")
-        if app.config.get("ALLOW_DATABASE_INIT") and not app.config.get("MAINTENANCE_MODE"):
-            raise RuntimeError("ALLOW_DATABASE_INIT is only permitted while MAINTENANCE_MODE is enabled.")
-        if not os.path.isfile(database_path) and not (
-            app.config.get("ALLOW_DATABASE_INIT") and app.config.get("MAINTENANCE_MODE")
-        ):
-            raise RuntimeError(
-                "Production database file is missing. Restore a verified database copy to the persistent disk first."
-            )
+    production = app.config.get("APP_ENV") == "production" and not app.testing
+    if production:
+        if not app.config.get("DATABASE_URL"):
+            raise RuntimeError("Set DATABASE_URL to the Neon PostgreSQL connection string.")
+        if make_url(app.config["SQLALCHEMY_DATABASE_URI"]).get_backend_name() != "postgresql":
+            raise RuntimeError("Production requires PostgreSQL through DATABASE_URL; SQLite is development-only.")
     if not app.config.get("SECRET_KEY"):
         if not app.testing:
             raise RuntimeError("Set SECRET_KEY in your .env file before starting the app.")
@@ -69,11 +64,6 @@ def create_app(test_config=None):
         db.session.execute(text("SELECT 1"))
         return jsonify(status="ok")
 
-    @app.before_request
-    def maintenance_mode():
-        if app.config.get("MAINTENANCE_MODE") and request.endpoint != "healthz":
-            return "Temporarily unavailable for database maintenance.", 503
-
     @app.after_request
     def security_headers(response):
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -92,8 +82,18 @@ def create_app(test_config=None):
         return redirect(url_for("auth.login")), 429
 
     with app.app_context():
-        db.create_all()
-        if "pending_totp_secret" not in {column["name"] for column in inspect(db.engine).get_columns("user")}:
-            with db.engine.begin() as connection:
-                connection.execute(text("ALTER TABLE user ADD COLUMN pending_totp_secret BLOB"))
+        if production:
+            if not inspect(db.engine).has_table("user"):
+                raise RuntimeError("Production database is missing the user schema; run the migration utility explicitly.")
+            from .models import User
+            actual = {column["name"] for column in inspect(db.engine).get_columns(User.__tablename__)}
+            required = set(User.__table__.columns.keys())
+            missing = sorted(required - actual)
+            if missing:
+                raise RuntimeError("Production user schema is incomplete; run a reviewed database migration.")
+        else:
+            db.create_all()
+            if "pending_totp_secret" not in {column["name"] for column in inspect(db.engine).get_columns("user")}:
+                with db.engine.begin() as connection:
+                    connection.execute(text("ALTER TABLE user ADD COLUMN pending_totp_secret BLOB"))
     return app

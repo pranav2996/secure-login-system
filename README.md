@@ -21,7 +21,7 @@ Pages share a dark navy glass panel system and locally available system font sta
 
 ## Technology and layout
 
-Python 3, Flask, Flask-SQLAlchemy, SQLite, Flask-WTF, Flask-Limiter, bcrypt, PyOTP, qrcode, and pytest. Routes are separated under `app/routes/`; HTML is in `app/templates/`; browser assets are under `app/static/`; automated tests are under `tests/`.
+Python 3, Flask, Flask-SQLAlchemy, SQLite for local development, PostgreSQL with Psycopg 3 for deployment, Flask-WTF, Flask-Limiter, bcrypt, PyOTP, qrcode, and pytest. Routes are separated under `app/routes/`; HTML is in `app/templates/`; browser assets are under `app/static/`; automated tests are under `tests/`.
 
 ## Prerequisites and setup
 
@@ -58,78 +58,61 @@ The launcher creates `venv` and a unique local `.env` if absent, installs the pi
 
 ## Deploy to Render
 
-Render serves this Flask application through Gunicorn using the WSGI object `run:app`. Render terminates HTTPS at its load balancer and forwards requests to the service. The production configuration trusts one forwarded proxy hop, marks session cookies `Secure`, and still requires CSRF protection. The `/healthz` endpoint executes a small database query and is suitable for Render's HTTP health check.
+Render serves this Flask application through Gunicorn using the WSGI object `run:app`. Render terminates HTTPS at its load balancer and forwards requests to the service. In production, the app trusts one forwarded proxy hop, requires secure session cookies, keeps CSRF enabled, and checks the PostgreSQL schema without creating or altering it. `/healthz` runs `SELECT 1` and is suitable for Render's health check.
+
+This app currently has one application table, `user`. Production startup refuses SQLite and refuses a missing or incomplete PostgreSQL schema. It does not create tables, seed accounts, or run migrations. Transfer existing users with the explicit migration process below before the first production deploy.
+
+### Create a Neon database
+
+Create a PostgreSQL project in [Neon](https://neon.tech/) and choose the Singapore region if it is offered for your account. In the Neon console, copy the **pooled** connection string for the application role and database. Neon’s pooled hostname includes `-pooler`; keep `sslmode=require`. Treat this URL as a password: do not put it in Git, README, screenshots, or chat. The app normalizes it to the Psycopg 3 SQLAlchemy driver. Do not use a Neon API key or a client-side/JavaScript connection method.
+
+The Neon Free plan currently includes up to 1 GB storage per project and 100 CU-hours per month; compute suspends when idle and wakes on connection. Limits and plan details can change; check [Neon pricing](https://neon.com/pricing) before relying on them.
 
 ### Create the Render web service
 
-Connect the private GitHub repository and create a **paid Python web service**. A persistent disk is required for SQLite; Render does not provide persistent disks for Free web services. Configure:
+Connect the GitHub repository and create a Python web service. Render's Free web services have an ephemeral filesystem, which is fine after the app uses Neon because user data resides in PostgreSQL. No disk is used. Set:
 
 | Setting | Value |
 | --- | --- |
+| Branch | `main` |
 | Build command | `pip install -r requirements.txt` |
 | Start command | `gunicorn --bind 0.0.0.0:$PORT --workers 1 --access-logfile - --error-logfile - run:app` |
 | Health check path | `/healthz` |
-| Persistent disk mount path | `/var/data` |
-| Python version | `3.14` (also pinned in `.python-version`) |
+| Python version | `3.14` (pinned in `.python-version`) |
 
-The single Gunicorn worker and single Render instance avoid concurrent multi-process writes to SQLite. Do not scale this SQLite service horizontally. The rate limiter uses in-memory storage and is process-local; use a shared production rate-limit store before running multiple app processes or instances.
+Render supplies `PORT`; do not set it yourself. The service sleeps after 15 minutes without traffic on the Free plan, so its first request after sleep can take about a minute. Render describes Free services as suitable for hobby/testing, not production workloads; use a paid plan for production availability. See [Render Free](https://render.com/docs/free) for current limits. The rate limiter uses in-memory storage by default; on Free this state resets when the service restarts or sleeps and it does not coordinate across instances. A shared rate-limit store is needed before scaling.
 
-Set these values in the Render service's **Environment** page. Do not put real secret values in `render.yaml`, Git, or chat.
+Set these variables in Render's **Environment** page. Enter secret values directly in the dashboard; never add real values to `render.yaml`, Git, README, or chat.
 
 | Variable | Value |
 | --- | --- |
 | `APP_ENV` | `production` |
-| `SECRET_KEY` | Generate a long random secret with `python -c "import secrets; print(secrets.token_hex(32))"` and enter it directly in Render. Changing it later signs out existing sessions. |
-| `ENCRYPTION_KEY` | The current local `.env` value if you are migrating existing users with 2FA; changing it makes their stored TOTP secrets unreadable. Enter it directly in Render and keep a secure backup. |
-| `DATABASE_PATH` | `/var/data/secure_login.db` after the database copy is in place |
-| `COOKIE_SECURE` | `true` |
-| `TRUST_PROXY` | `true` |
+| `DATABASE_URL` | Neon pooled PostgreSQL connection string with `sslmode=require` |
+| `SECRET_KEY` | Use the existing local `.env` value to preserve current signing configuration, or use a planned rotation. Changing it signs out existing sessions. Enter it directly in Render. |
+| `ENCRYPTION_KEY` | Use the existing local `.env` value. Changing it makes existing encrypted TOTP secrets unreadable. Enter it directly in Render and keep a secure backup. |
+| `COOKIE_SECURE` | `true` (also forced by production configuration) |
+| `TRUST_PROXY` | `true` (also forced by production configuration) |
+| `RATELIMIT_STORAGE_URI` | Leave unset to use `memory://` for one free instance, or configure a separately managed shared store before scaling. |
 
-Render supplies `PORT`; do not hard-code or manually set it. The application refuses production startup if `DATABASE_PATH` is missing or if its database file is absent. It will not silently create a new empty production database. `DATABASE_URL` remains supported for local use and compatibility, but use `DATABASE_PATH` for the Render SQLite disk.
+Do not set `DATABASE_PATH` on Render. It is retained only for local SQLite compatibility. Production requires `DATABASE_URL` pointing to PostgreSQL.
 
-### Preserve and transfer the existing SQLite database
+### Migrate existing local users safely
 
-The local database is deliberately not part of Git, and deploying source code does not transfer its users. Render disks are available only at runtime, are attached to a paid service, and preserve only files under their mount path. Seed the disk with a verified backup before opening the app to users. This process creates a separate backup copy and never replaces or edits the original local database.
+The migration utility copies the existing SQLite `user` rows, retaining primary keys, password hashes, encrypted TOTP values, pending TOTP values, recovery-code hashes, flags, and timestamps. It opens the SQLite source in read-only mode and never changes it. PostgreSQL changes are append-only: it creates `user` only if the selected schema has no tables, skips byte-for-byte equivalent rows, and aborts on schema mismatches, duplicate identities, or conflicting rows. It does not drop, truncate, update, or delete records. Review and retain a separate secure backup of the local database before proceeding.
 
-1. In PowerShell at the project root, make a consistent SQLite online backup to a new, uniquely named local file:
+Run this from a secure local environment, after installing project requirements and setting `DATABASE_URL` in that environment from your secret store. The command does not read `.env`. Keep the URL out of shell history and logs. The first command is a dry run and prints only row counts and whether the table would be created:
 
-   ```powershell
-   $env:DB_COPY = Join-Path $PWD ("secure-login-migration-" + [guid]::NewGuid().ToString("N") + ".db")
-   @'
-   import os, sqlite3
-   from pathlib import Path
-   source_path = Path("instance/secure_login.db").resolve()
-   source = sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True)
-   destination_path = os.environ["DB_COPY"]
-   if os.path.exists(destination_path):
-       raise SystemExit("Refusing to replace an existing backup file")
-   destination = sqlite3.connect(destination_path)
-   source.backup(destination)
-   result = destination.execute("PRAGMA integrity_check").fetchone()[0]
-   destination.close()
-   source.close()
-   if result != "ok":
-       raise SystemExit("Backup integrity check failed")
-   print("Verified database backup created")
-   '@ | .\venv\Scripts\python.exe -
-   ```
+```powershell
+.\venv\Scripts\python.exe .\migrate_sqlite_to_postgres.py --source .\instance\secure_login.db
+```
 
-2. Create the paid web service with the `/var/data` disk. For the first deploy only, set `DATABASE_PATH=/var/data/secure-login-bootstrap.db`, `APP_ENV=production`, `MAINTENANCE_MODE=true`, and `ALLOW_DATABASE_INIT=true`. Add the secrets above. The app will create a separate empty bootstrap database, keep application routes at HTTP 503, and leave `/healthz` available so the instance can become healthy. Do not share the service URL during this temporary maintenance period.
-3. Set up SSH for the paid Render service, then copy the backup to a new path on the mounted disk. Replace the local filename, service name, and region with your actual values:
+Check the output and Neon schema, then only when ready to write run the same command with both explicit flags:
 
-   ```powershell
-   scp -s $env:DB_COPY YOUR_SERVICE@ssh.YOUR_REGION.render.com:/var/data/secure_login_imported.db
-   ```
+```powershell
+.\venv\Scripts\python.exe .\migrate_sqlite_to_postgres.py --source .\instance\secure_login.db --apply --confirm
+```
 
-   Do not use an existing destination filename. In the Render Shell, verify the copied file without displaying user data:
-
-   ```sh
-   python -c "import sqlite3; c=sqlite3.connect('file:/var/data/secure_login_imported.db?mode=ro', uri=True); print(c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
-   ```
-
-4. In Render, change `DATABASE_PATH` to `/var/data/secure_login_imported.db`, set `MAINTENANCE_MODE=false` and `ALLOW_DATABASE_INIT=false`, then redeploy. Keep the original local database and the verified local backup safe. The bootstrap file remains separate and is not used by the app.
-
-Back up the persistent disk regularly. A Render persistent disk is attached to one service instance and prevents scaling that service to multiple instances. For higher availability or concurrent scaling, plan a separately reviewed migration to managed PostgreSQL; do not point this SQLite application at an ephemeral filesystem.
+Do not run the apply command until you have reviewed the dry-run result and confirmed that `DATABASE_URL` targets the intended Neon database. Then deploy the app. Startup checks for the complete `user` table and fails closed if it is missing; it will not initialize a blank production database. The source file remains unchanged and excluded from Git.
 
 ## Use the app
 
@@ -157,7 +140,7 @@ Tests use isolated temporary SQLite databases. They cover registration validatio
 
 ## Security and limitations
 
-Passwords are bcrypt hashes with per-password salts; TOTP secrets are encrypted using the environment-held key; recovery codes are individually hashed and consumed on use. ORM queries, CSRF protection, rate limits, output escaping, security headers, and conservative cookie settings reduce common risks. The app deliberately does not log credentials. The built-in server and in-memory rate limiter are for local development; Render uses Gunicorn, HTTPS-aware proxy handling, secure cookies, and a persistent disk for SQLite. There is no email verification, password reset, account lockout, shared rate-limit store, or encryption-key rotation workflow. QR setup content and secrets should be treated as sensitive. Always use a unique `SECRET_KEY` and protect the existing `ENCRYPTION_KEY` when migrating users with 2FA.
+Passwords are bcrypt hashes with per-password salts; TOTP secrets are encrypted using the environment-held key; recovery codes are individually hashed and consumed on use. ORM queries, CSRF protection, rate limits, output escaping, security headers, and conservative cookie settings reduce common risks. The app deliberately does not log credentials. Render uses Gunicorn, HTTPS-aware proxy handling, secure cookies, and Neon PostgreSQL. The Free deployment's in-memory rate limiter resets when the service restarts and is not shared across multiple instances. There is no email verification, password reset, account lockout, shared rate-limit store, or encryption-key rotation workflow. QR setup content and secrets should be treated as sensitive. Always use a unique `SECRET_KEY` and protect the existing `ENCRYPTION_KEY` when migrating users with 2FA.
 
 ## Troubleshooting
 
