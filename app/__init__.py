@@ -2,8 +2,9 @@ import os
 import secrets
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
-from flask import Flask, flash, redirect, request, session, url_for
+from flask import Flask, flash, jsonify, redirect, request, session, url_for
 from sqlalchemy import inspect, text
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .extensions import csrf, db, limiter
 
@@ -16,6 +17,25 @@ def create_app(test_config=None):
     app.config.setdefault("MAX_CONTENT_LENGTH", 16 * 1024)
     if test_config:
         app.config.update(test_config)
+    if app.config.get("APP_ENV") == "production":
+        app.config["SESSION_COOKIE_SECURE"] = True
+        app.config["PREFERRED_URL_SCHEME"] = "https"
+        app.config["TRUST_PROXY"] = True
+    if app.config.get("TRUST_PROXY"):
+        # Render terminates TLS and forwards the original client scheme/IP.
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+    if app.config.get("APP_ENV") == "production":
+        database_path = app.config.get("DATABASE_PATH")
+        if not database_path or not os.path.isabs(database_path):
+            raise RuntimeError("Set DATABASE_PATH to an absolute path on Render's persistent disk.")
+        if app.config.get("ALLOW_DATABASE_INIT") and not app.config.get("MAINTENANCE_MODE"):
+            raise RuntimeError("ALLOW_DATABASE_INIT is only permitted while MAINTENANCE_MODE is enabled.")
+        if not os.path.isfile(database_path) and not (
+            app.config.get("ALLOW_DATABASE_INIT") and app.config.get("MAINTENANCE_MODE")
+        ):
+            raise RuntimeError(
+                "Production database file is missing. Restore a verified database copy to the persistent disk first."
+            )
     if not app.config.get("SECRET_KEY"):
         if not app.testing:
             raise RuntimeError("Set SECRET_KEY in your .env file before starting the app.")
@@ -30,6 +50,9 @@ def create_app(test_config=None):
         raise RuntimeError("ENCRYPTION_KEY must be a valid Fernet key.") from exc
 
     os.makedirs(app.instance_path, exist_ok=True)
+    configured_db_path = app.config.get("DATABASE_PATH")
+    if configured_db_path:
+        os.makedirs(os.path.dirname(os.path.abspath(configured_db_path)), exist_ok=True)
     db.init_app(app)
     csrf.init_app(app)
     limiter.init_app(app)
@@ -40,6 +63,16 @@ def create_app(test_config=None):
     app.register_blueprint(auth_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(security_bp)
+
+    @app.get("/healthz")
+    def healthz():
+        db.session.execute(text("SELECT 1"))
+        return jsonify(status="ok")
+
+    @app.before_request
+    def maintenance_mode():
+        if app.config.get("MAINTENANCE_MODE") and request.endpoint != "healthz":
+            return "Temporarily unavailable for database maintenance.", 503
 
     @app.after_request
     def security_headers(response):

@@ -56,6 +56,81 @@ Set-Location "C:\Users\prana\Desktop\Secure login page"
 
 The launcher creates `venv` and a unique local `.env` if absent, installs the pinned dependencies in the venv, initializes SQLite on application startup, and binds the development server only to `127.0.0.1:5000`. Open [http://127.0.0.1:5000](http://127.0.0.1:5000). On Linux/macOS run `sh ./run.sh`.
 
+## Deploy to Render
+
+Render serves this Flask application through Gunicorn using the WSGI object `run:app`. Render terminates HTTPS at its load balancer and forwards requests to the service. The production configuration trusts one forwarded proxy hop, marks session cookies `Secure`, and still requires CSRF protection. The `/healthz` endpoint executes a small database query and is suitable for Render's HTTP health check.
+
+### Create the Render web service
+
+Connect the private GitHub repository and create a **paid Python web service**. A persistent disk is required for SQLite; Render does not provide persistent disks for Free web services. Configure:
+
+| Setting | Value |
+| --- | --- |
+| Build command | `pip install -r requirements.txt` |
+| Start command | `gunicorn --bind 0.0.0.0:$PORT --workers 1 --access-logfile - --error-logfile - run:app` |
+| Health check path | `/healthz` |
+| Persistent disk mount path | `/var/data` |
+| Python version | `3.14` (also pinned in `.python-version`) |
+
+The single Gunicorn worker and single Render instance avoid concurrent multi-process writes to SQLite. Do not scale this SQLite service horizontally. The rate limiter uses in-memory storage and is process-local; use a shared production rate-limit store before running multiple app processes or instances.
+
+Set these values in the Render service's **Environment** page. Do not put real secret values in `render.yaml`, Git, or chat.
+
+| Variable | Value |
+| --- | --- |
+| `APP_ENV` | `production` |
+| `SECRET_KEY` | Generate a long random secret with `python -c "import secrets; print(secrets.token_hex(32))"` and enter it directly in Render. Changing it later signs out existing sessions. |
+| `ENCRYPTION_KEY` | The current local `.env` value if you are migrating existing users with 2FA; changing it makes their stored TOTP secrets unreadable. Enter it directly in Render and keep a secure backup. |
+| `DATABASE_PATH` | `/var/data/secure_login.db` after the database copy is in place |
+| `COOKIE_SECURE` | `true` |
+| `TRUST_PROXY` | `true` |
+
+Render supplies `PORT`; do not hard-code or manually set it. The application refuses production startup if `DATABASE_PATH` is missing or if its database file is absent. It will not silently create a new empty production database. `DATABASE_URL` remains supported for local use and compatibility, but use `DATABASE_PATH` for the Render SQLite disk.
+
+### Preserve and transfer the existing SQLite database
+
+The local database is deliberately not part of Git, and deploying source code does not transfer its users. Render disks are available only at runtime, are attached to a paid service, and preserve only files under their mount path. Seed the disk with a verified backup before opening the app to users. This process creates a separate backup copy and never replaces or edits the original local database.
+
+1. In PowerShell at the project root, make a consistent SQLite online backup to a new, uniquely named local file:
+
+   ```powershell
+   $env:DB_COPY = Join-Path $PWD ("secure-login-migration-" + [guid]::NewGuid().ToString("N") + ".db")
+   @'
+   import os, sqlite3
+   from pathlib import Path
+   source_path = Path("instance/secure_login.db").resolve()
+   source = sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True)
+   destination_path = os.environ["DB_COPY"]
+   if os.path.exists(destination_path):
+       raise SystemExit("Refusing to replace an existing backup file")
+   destination = sqlite3.connect(destination_path)
+   source.backup(destination)
+   result = destination.execute("PRAGMA integrity_check").fetchone()[0]
+   destination.close()
+   source.close()
+   if result != "ok":
+       raise SystemExit("Backup integrity check failed")
+   print("Verified database backup created")
+   '@ | .\venv\Scripts\python.exe -
+   ```
+
+2. Create the paid web service with the `/var/data` disk. For the first deploy only, set `DATABASE_PATH=/var/data/secure-login-bootstrap.db`, `APP_ENV=production`, `MAINTENANCE_MODE=true`, and `ALLOW_DATABASE_INIT=true`. Add the secrets above. The app will create a separate empty bootstrap database, keep application routes at HTTP 503, and leave `/healthz` available so the instance can become healthy. Do not share the service URL during this temporary maintenance period.
+3. Set up SSH for the paid Render service, then copy the backup to a new path on the mounted disk. Replace the local filename, service name, and region with your actual values:
+
+   ```powershell
+   scp -s $env:DB_COPY YOUR_SERVICE@ssh.YOUR_REGION.render.com:/var/data/secure_login_imported.db
+   ```
+
+   Do not use an existing destination filename. In the Render Shell, verify the copied file without displaying user data:
+
+   ```sh
+   python -c "import sqlite3; c=sqlite3.connect('file:/var/data/secure_login_imported.db?mode=ro', uri=True); print(c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
+   ```
+
+4. In Render, change `DATABASE_PATH` to `/var/data/secure_login_imported.db`, set `MAINTENANCE_MODE=false` and `ALLOW_DATABASE_INIT=false`, then redeploy. Keep the original local database and the verified local backup safe. The bootstrap file remains separate and is not used by the app.
+
+Back up the persistent disk regularly. A Render persistent disk is attached to one service instance and prevents scaling that service to multiple instances. For higher availability or concurrent scaling, plan a separately reviewed migration to managed PostgreSQL; do not point this SQLite application at an ephemeral filesystem.
+
 ## Use the app
 
 Create an account with a password of at least eight characters containing a letter, number, and symbol. Sign in with username/email and password. On the dashboard, choose **Set up 2FA**, scan the QR in an authenticator app, and submit the current six-digit code. Save the eight recovery codes; each is one-use. To disable 2FA, provide your password and a current authenticator code. Logout is a CSRF-protected POST.
@@ -82,7 +157,7 @@ Tests use isolated temporary SQLite databases. They cover registration validatio
 
 ## Security and limitations
 
-Passwords are bcrypt hashes with per-password salts; TOTP secrets are encrypted using Fernet and the environment-held key; recovery codes are individually hashed and consumed on use. ORM queries, CSRF protection, rate limits, output escaping, security headers, and conservative cookie settings reduce common risks. The app deliberately does not log credentials. The built-in server and in-memory rate limiter are for local development, not production deployment. Production should use HTTPS, set `COOKIE_SECURE=true`, configure a production WSGI server, persistent shared rate-limit storage, backups, monitoring, and secret management. There is no email verification, password reset, account lockout, or encryption-key rotation workflow. QR setup content and secrets should be treated as sensitive. Always use a unique `SECRET_KEY` and `ENCRYPTION_KEY`; development fallback keys are refused outside tests.
+Passwords are bcrypt hashes with per-password salts; TOTP secrets are encrypted using the environment-held key; recovery codes are individually hashed and consumed on use. ORM queries, CSRF protection, rate limits, output escaping, security headers, and conservative cookie settings reduce common risks. The app deliberately does not log credentials. The built-in server and in-memory rate limiter are for local development; Render uses Gunicorn, HTTPS-aware proxy handling, secure cookies, and a persistent disk for SQLite. There is no email verification, password reset, account lockout, shared rate-limit store, or encryption-key rotation workflow. QR setup content and secrets should be treated as sensitive. Always use a unique `SECRET_KEY` and protect the existing `ENCRYPTION_KEY` when migrating users with 2FA.
 
 ## Troubleshooting
 

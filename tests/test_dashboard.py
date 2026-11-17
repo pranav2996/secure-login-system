@@ -20,3 +20,9 @@ def test_protected_response_disables_caching(client):
     register(client)
     login(client)
     assert client.get("/dashboard").headers["Cache-Control"] == "no-store, max-age=0"
+
+
+def test_health_check_reports_database_ready(client):
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json == {"status": "ok"}
