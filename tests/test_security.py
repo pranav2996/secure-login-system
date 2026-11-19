@@ -25,6 +25,26 @@ def secret_for(app):
         return app.extensions["totp_fernet"].decrypt(token).decode()
 
 
+def test_back_to_sign_in_is_a_get_link(client, app):
+    register(client)
+    login(client)
+    client.get("/security/2fa/enable")
+    secret = secret_for(app)
+    client.post("/security/2fa/enable", data={"code":pyotp.TOTP(secret).now()})
+    client.post("/logout")
+    client.post("/login", data={"identity":"sample_user", "password":"Passw0rd!"})
+
+    verify_response = client.get("/verify-2fa")
+    assert verify_response.status_code == 200
+    assert b'href="/login"' in verify_response.data
+    assert b"logout-form" not in verify_response.data
+    assert b"event.preventDefault()" not in verify_response.data
+
+    login_response = client.get("/login")
+    assert login_response.status_code == 200
+    assert client.put("/login").status_code == 405
+
+
 def test_totp_enrollment_and_login(client, app):
     register(client)
     login(client)
